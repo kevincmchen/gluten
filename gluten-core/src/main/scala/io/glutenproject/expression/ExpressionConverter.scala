@@ -18,13 +18,14 @@ package io.glutenproject.expression
 
 import io.glutenproject.GlutenConfig
 import io.glutenproject.backendsapi.BackendsApiManager
+import io.glutenproject.exception.GlutenNotSupportException
 import io.glutenproject.execution.{ColumnarToRowExecBase, WholeStageTransformer}
 import io.glutenproject.test.TestStats
 import io.glutenproject.utils.{DecimalArithmeticUtil, PlanUtil}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.{InternalRow, SQLConfHelper}
-import org.apache.spark.sql.catalyst.expressions.{BinaryArithmetic, _}
+import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
 import org.apache.spark.sql.catalyst.optimizer.NormalizeNaNAndZero
 import org.apache.spark.sql.execution.{ScalarSubquery, _}
@@ -74,7 +75,7 @@ object ExpressionConverter extends SQLConfHelper with Logging {
             replaceWithExpressionTransformerInternal(_, attributeSeq, expressionsMap)),
           udf)
       case _ =>
-        throw new UnsupportedOperationException(s"Not supported python udf: $udf.")
+        throw new GlutenNotSupportException(s"Not supported python udf: $udf.")
     }
   }
 
@@ -91,7 +92,7 @@ object ExpressionConverter extends SQLConfHelper with Logging {
             replaceWithExpressionTransformerInternal(_, attributeSeq, expressionsMap)),
           udf)
       case _ =>
-        throw new UnsupportedOperationException(s"Not supported scala udf: $udf.")
+        throw new GlutenNotSupportException(s"Not supported scala udf: $udf.")
     }
   }
 
@@ -117,13 +118,15 @@ object ExpressionConverter extends SQLConfHelper with Logging {
     // Check whether Gluten supports this expression
     val substraitExprNameOpt = expressionsMap.get(expr.getClass)
     if (substraitExprNameOpt.isEmpty) {
-      throw new UnsupportedOperationException(s"Not supported: $expr. ${expr.getClass}")
+      throw new GlutenNotSupportException(
+        s"Not supported to map spark function name" +
+          s" to substrait function name: $expr, class name: ${expr.getClass.getSimpleName}.")
     }
     val substraitExprName = substraitExprNameOpt.get
 
     // Check whether each backend supports this expression
     if (!BackendsApiManager.getValidatorApiInstance.doExprValidate(substraitExprName, expr)) {
-      throw new UnsupportedOperationException(s"Not supported: $expr.")
+      throw new GlutenNotSupportException(s"Not supported: $expr.")
     }
     expr match {
       case extendedExpr
@@ -155,6 +158,11 @@ object ExpressionConverter extends SQLConfHelper with Logging {
           replaceWithExpressionTransformerInternal(g.key, attributeSeq, expressionsMap),
           g
         )
+      case m: MapEntries =>
+        BackendsApiManager.getSparkPlanExecApiInstance.genMapEntriesTransformer(
+          substraitExprName,
+          replaceWithExpressionTransformerInternal(m.child, attributeSeq, expressionsMap),
+          m)
       case e: Explode =>
         ExplodeTransformer(
           substraitExprName,
@@ -166,6 +174,11 @@ object ExpressionConverter extends SQLConfHelper with Logging {
           replaceWithExpressionTransformerInternal(p.child, attributeSeq, expressionsMap),
           p,
           attributeSeq)
+      case i: Inline =>
+        BackendsApiManager.getSparkPlanExecApiInstance.genInlineTransformer(
+          substraitExprName,
+          replaceWithExpressionTransformerInternal(i.child, attributeSeq, expressionsMap),
+          i)
       case a: Alias =>
         BackendsApiManager.getSparkPlanExecApiInstance.genAliasTransformer(
           substraitExprName,
@@ -198,20 +211,18 @@ object ExpressionConverter extends SQLConfHelper with Logging {
         BoundReferenceTransformer(b.ordinal, b.dataType, b.nullable)
       case l: Literal =>
         LiteralTransformer(l)
-      case f: FromUnixTime =>
-        FromUnixTimeTransformer(
-          substraitExprName,
-          replaceWithExpressionTransformerInternal(f.sec, attributeSeq, expressionsMap),
-          replaceWithExpressionTransformerInternal(f.format, attributeSeq, expressionsMap),
-          f.timeZoneId,
-          f
-        )
       case d: DateDiff =>
         DateDiffTransformer(
           substraitExprName,
           replaceWithExpressionTransformerInternal(d.endDate, attributeSeq, expressionsMap),
           replaceWithExpressionTransformerInternal(d.startDate, attributeSeq, expressionsMap),
           d
+        )
+      case r: Round if r.child.dataType.isInstanceOf[DecimalType] =>
+        BackendsApiManager.getSparkPlanExecApiInstance.genDecimalRoundTransformer(
+          substraitExprName,
+          replaceWithExpressionTransformerInternal(r.child, attributeSeq, expressionsMap),
+          r
         )
       case t: ToUnixTimestamp =>
         BackendsApiManager.getSparkPlanExecApiInstance.genUnixTimestampTransformer(
@@ -270,6 +281,10 @@ object ExpressionConverter extends SQLConfHelper with Logging {
           cw
         )
       case i: In =>
+        if (i.list.exists(!_.foldable)) {
+          throw new GlutenNotSupportException(
+            s"In list option does not support non-foldable expression, ${i.list.map(_.sql)}")
+        }
         InTransformer(
           replaceWithExpressionTransformerInternal(i.value, attributeSeq, expressionsMap),
           i.list,
@@ -320,6 +335,18 @@ object ExpressionConverter extends SQLConfHelper with Logging {
             expressionsMap),
           getStructField.ordinal,
           getStructField)
+      case getArrayStructFields: GetArrayStructFields =>
+        GetArrayStructFieldsTransformer(
+          substraitExprName,
+          replaceWithExpressionTransformerInternal(
+            getArrayStructFields.child,
+            attributeSeq,
+            expressionsMap),
+          getArrayStructFields.ordinal,
+          getArrayStructFields.numFields,
+          getArrayStructFields.containsNull,
+          getArrayStructFields
+        )
       case t: StringTranslate =>
         BackendsApiManager.getSparkPlanExecApiInstance.genStringTranslateTransformer(
           substraitExprName,
@@ -458,7 +485,7 @@ object ExpressionConverter extends SQLConfHelper with Logging {
         // PrecisionLoss=false: velox not support / ch support
         // TODO ch support PrecisionLoss=true
         if (!BackendsApiManager.getSettings.allowDecimalArithmetic) {
-          throw new UnsupportedOperationException(
+          throw new GlutenNotSupportException(
             s"Not support ${SQLConf.DECIMAL_OPERATIONS_ALLOW_PREC_LOSS.key} " +
               s"${conf.decimalOperationsAllowPrecisionLoss} mode")
         }
@@ -496,6 +523,11 @@ object ExpressionConverter extends SQLConfHelper with Logging {
           replaceWithExpressionTransformerInternal(n.right, attributeSeq, expressionsMap),
           n
         )
+      case m: MakeTimestamp =>
+        BackendsApiManager.getSparkPlanExecApiInstance.genMakeTimestampTransformer(
+          substraitExprName,
+          m.children.map(replaceWithExpressionTransformerInternal(_, attributeSeq, expressionsMap)),
+          m)
       case e: Transformable =>
         val childrenTransformers =
           e.children.map(replaceWithExpressionTransformerInternal(_, attributeSeq, expressionsMap))
@@ -518,9 +550,7 @@ object ExpressionConverter extends SQLConfHelper with Logging {
    * @return
    *   Transformed partition filter
    */
-  def transformDynamicPruningExpr(
-      partitionFilters: Seq[Expression],
-      reuseSubquery: Boolean): Seq[Expression] = {
+  def transformDynamicPruningExpr(partitionFilters: Seq[Expression]): Seq[Expression] = {
 
     def convertBroadcastExchangeToColumnar(
         exchange: BroadcastExchangeExec): ColumnarBroadcastExchangeExec = {
@@ -579,7 +609,7 @@ object ExpressionConverter extends SQLConfHelper with Logging {
                   // the AdaptiveSparkPlanExec.AdaptiveExecutionContext to hold the reused map
                   // for each query.
                   newIn.child match {
-                    case a: AdaptiveSparkPlanExec if reuseSubquery =>
+                    case a: AdaptiveSparkPlanExec if SQLConf.get.subqueryReuseEnabled =>
                       // When AQE is on and reuseSubquery is on.
                       a.context.subqueryCache
                         .update(newIn.canonicalized, transformSubqueryBroadcast)

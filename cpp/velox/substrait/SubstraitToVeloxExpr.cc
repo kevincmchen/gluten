@@ -25,83 +25,6 @@
 using namespace facebook::velox;
 
 namespace {
-
-// Get values for the different supported types.
-template <typename T>
-T getLiteralValue(const ::substrait::Expression::Literal& /* literal */) {
-  VELOX_NYI();
-}
-
-template <>
-int8_t getLiteralValue(const ::substrait::Expression::Literal& literal) {
-  return static_cast<int8_t>(literal.i8());
-}
-
-template <>
-int16_t getLiteralValue(const ::substrait::Expression::Literal& literal) {
-  return static_cast<int16_t>(literal.i16());
-}
-
-template <>
-int32_t getLiteralValue(const ::substrait::Expression::Literal& literal) {
-  if (literal.has_date()) {
-    return int32_t(literal.date());
-  }
-  return literal.i32();
-}
-
-template <>
-int64_t getLiteralValue(const ::substrait::Expression::Literal& literal) {
-  if (literal.has_decimal()) {
-    auto decimal = literal.decimal().value();
-    int128_t decimalValue;
-    memcpy(&decimalValue, decimal.c_str(), 16);
-    return static_cast<int64_t>(decimalValue);
-  }
-  return literal.i64();
-}
-
-template <>
-int128_t getLiteralValue(const ::substrait::Expression::Literal& literal) {
-  auto decimal = literal.decimal().value();
-  int128_t decimalValue;
-  memcpy(&decimalValue, decimal.c_str(), 16);
-  return HugeInt::build(static_cast<uint64_t>(decimalValue >> 64), static_cast<uint64_t>(decimalValue));
-}
-
-template <>
-double getLiteralValue(const ::substrait::Expression::Literal& literal) {
-  return literal.fp64();
-}
-
-template <>
-float getLiteralValue(const ::substrait::Expression::Literal& literal) {
-  return literal.fp32();
-}
-
-template <>
-bool getLiteralValue(const ::substrait::Expression::Literal& literal) {
-  return literal.boolean();
-}
-
-template <>
-Timestamp getLiteralValue(const ::substrait::Expression::Literal& literal) {
-  return Timestamp::fromMicros(literal.timestamp());
-}
-
-template <>
-StringView getLiteralValue(const ::substrait::Expression::Literal& literal) {
-  if (literal.has_string()) {
-    return StringView(literal.string());
-  } else if (literal.has_var_char()) {
-    return StringView(literal.var_char().value());
-  } else if (literal.has_binary()) {
-    return StringView(literal.binary());
-  } else {
-    VELOX_FAIL("Unexpected string or binary literal");
-  }
-}
-
 ArrayVectorPtr makeArrayVector(const VectorPtr& elements) {
   BufferPtr offsets = allocateOffsets(1, elements->pool());
   BufferPtr sizes = allocateOffsets(1, elements->pool());
@@ -137,16 +60,16 @@ RowVectorPtr makeRowVector(const std::vector<VectorPtr>& children) {
   return std::make_shared<RowVector>(children[0]->pool(), rowType, BufferPtr(nullptr), vectorSize, children);
 }
 
-ArrayVectorPtr makeEmptyArrayVector(memory::MemoryPool* pool) {
+ArrayVectorPtr makeEmptyArrayVector(memory::MemoryPool* pool, const TypePtr& elementType) {
   BufferPtr offsets = allocateOffsets(1, pool);
   BufferPtr sizes = allocateOffsets(1, pool);
-  return std::make_shared<ArrayVector>(pool, ARRAY(UNKNOWN()), nullptr, 1, offsets, sizes, nullptr);
+  return std::make_shared<ArrayVector>(pool, ARRAY(elementType), nullptr, 1, offsets, sizes, nullptr);
 }
 
-MapVectorPtr makeEmptyMapVector(memory::MemoryPool* pool) {
+MapVectorPtr makeEmptyMapVector(memory::MemoryPool* pool, const TypePtr& keyType, const TypePtr& valueType) {
   BufferPtr offsets = allocateOffsets(1, pool);
   BufferPtr sizes = allocateOffsets(1, pool);
-  return std::make_shared<MapVector>(pool, MAP(UNKNOWN(), UNKNOWN()), nullptr, 1, offsets, sizes, nullptr, nullptr);
+  return std::make_shared<MapVector>(pool, MAP(keyType, valueType), nullptr, 1, offsets, sizes, nullptr, nullptr);
 }
 
 RowVectorPtr makeEmptyRowVector(memory::MemoryPool* pool) {
@@ -158,7 +81,7 @@ void setLiteralValue(const ::substrait::Expression::Literal& literal, FlatVector
   if (literal.has_null()) {
     vector->setNull(index, true);
   } else {
-    vector->set(index, getLiteralValue<T>(literal));
+    vector->set(index, gluten::SubstraitParser::getLiteralValue<T>(literal));
   }
 }
 
@@ -227,7 +150,7 @@ bool isNullOnFailure(::substrait::Expression::Cast::FailureBehavior failureBehav
     case ::substrait::Expression_Cast_FailureBehavior_FAILURE_BEHAVIOR_RETURN_NULL:
       return true;
     default:
-      VELOX_NYI("The given failure behavior is NOT supported: '{}'", failureBehavior);
+      VELOX_NYI("The given failure behavior is NOT supported: '{}'", std::to_string(failureBehavior));
   }
 }
 
@@ -251,10 +174,12 @@ std::shared_ptr<core::ConstantTypedExpr> constructConstantVector(
     const TypePtr& type) {
   VELOX_CHECK(type->isPrimitiveType());
   if (substraitLit.has_binary()) {
-    return std::make_shared<core::ConstantTypedExpr>(type, variant::binary(getLiteralValue<StringView>(substraitLit)));
+    return std::make_shared<core::ConstantTypedExpr>(
+        type, variant::binary(gluten::SubstraitParser::getLiteralValue<StringView>(substraitLit)));
   } else {
     using T = typename TypeTraits<kind>::NativeType;
-    return std::make_shared<core::ConstantTypedExpr>(type, variant(getLiteralValue<T>(substraitLit)));
+    return std::make_shared<core::ConstantTypedExpr>(
+        type, variant(gluten::SubstraitParser::getLiteralValue<T>(substraitLit)));
   }
 }
 
@@ -298,7 +223,7 @@ std::shared_ptr<const core::FieldAccessTypedExpr> SubstraitVeloxExprConverter::t
       return fieldAccess;
     }
     default:
-      VELOX_NYI("Substrait conversion not supported for Reference '{}'", typeCase);
+      VELOX_NYI("Substrait conversion not supported for Reference '{}'", std::to_string(typeCase));
   }
 }
 
@@ -382,7 +307,7 @@ std::shared_ptr<const core::ConstantTypedExpr> SubstraitVeloxExprConverter::lite
   std::vector<variant> variants;
   variants.reserve(literals.size());
   VELOX_CHECK_GE(literals.size(), 0, "List should have at least one item.");
-  std::optional<TypePtr> literalType = std::nullopt;
+  std::optional<TypePtr> literalType;
   for (const auto& literal : literals) {
     auto veloxVariant = toVeloxExpr(literal);
     if (!literalType.has_value()) {
@@ -426,8 +351,19 @@ std::shared_ptr<const core::ConstantTypedExpr> SubstraitVeloxExprConverter::toVe
       auto constantVector = BaseVector::wrapInConstant(1, 0, literalsToArrayVector(substraitLit));
       return std::make_shared<const core::ConstantTypedExpr>(constantVector);
     }
+    case ::substrait::Expression_Literal::LiteralTypeCase::kEmptyList: {
+      auto elementType = SubstraitParser::parseType(substraitLit.empty_list().type());
+      auto constantVector = BaseVector::wrapInConstant(1, 0, makeEmptyArrayVector(pool_, elementType));
+      return std::make_shared<const core::ConstantTypedExpr>(constantVector);
+    }
     case ::substrait::Expression_Literal::LiteralTypeCase::kMap: {
       auto constantVector = BaseVector::wrapInConstant(1, 0, literalsToMapVector(substraitLit));
+      return std::make_shared<const core::ConstantTypedExpr>(constantVector);
+    }
+    case ::substrait::Expression_Literal::LiteralTypeCase::kEmptyMap: {
+      auto keyType = SubstraitParser::parseType(substraitLit.empty_map().key());
+      auto valueType = SubstraitParser::parseType(substraitLit.empty_map().value());
+      auto constantVector = BaseVector::wrapInConstant(1, 0, makeEmptyMapVector(pool_, keyType, valueType));
       return std::make_shared<const core::ConstantTypedExpr>(constantVector);
     }
     case ::substrait::Expression_Literal::LiteralTypeCase::kStruct: {
@@ -450,45 +386,42 @@ std::shared_ptr<const core::ConstantTypedExpr> SubstraitVeloxExprConverter::toVe
         auto kind = veloxType->kind();
         return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(constructConstantVector, kind, substraitLit, veloxType);
       }
-      VELOX_NYI("Substrait conversion not supported for type case '{}'", typeCase);
+      VELOX_NYI("Substrait conversion not supported for type case '{}'", std::to_string(typeCase));
   }
 }
 
 ArrayVectorPtr SubstraitVeloxExprConverter::literalsToArrayVector(const ::substrait::Expression::Literal& literal) {
   auto childSize = literal.list().values().size();
-  if (childSize == 0) {
-    return makeEmptyArrayVector(pool_);
-  }
-  auto childTypeCase = literal.list().values(0).literal_type_case();
+  VELOX_CHECK_GT(childSize, 0, "there should be at least 1 value in list literal.");
+  auto childLiteral = literal.list().values(0);
   auto elementAtFunc = [&](vector_size_t idx) { return literal.list().values(idx); };
-  auto childVector = literalsToVector(childTypeCase, childSize, literal, elementAtFunc);
+  auto childVector = literalsToVector(childLiteral, childSize, elementAtFunc);
   return makeArrayVector(childVector);
 }
 
 MapVectorPtr SubstraitVeloxExprConverter::literalsToMapVector(const ::substrait::Expression::Literal& literal) {
   auto childSize = literal.map().key_values().size();
-  if (childSize == 0) {
-    return makeEmptyMapVector(pool_);
-  }
-  auto keyTypeCase = literal.map().key_values(0).key().literal_type_case();
-  auto valueTypeCase = literal.map().key_values(0).value().literal_type_case();
+  VELOX_CHECK_GT(childSize, 0, "there should be at least 1 value in map literal.");
+  auto& keyLiteral = literal.map().key_values(0).key();
+  auto& valueLiteral = literal.map().key_values(0).value();
   auto keyAtFunc = [&](vector_size_t idx) { return literal.map().key_values(idx).key(); };
   auto valueAtFunc = [&](vector_size_t idx) { return literal.map().key_values(idx).value(); };
-  auto keyVector = literalsToVector(keyTypeCase, childSize, literal, keyAtFunc);
-  auto valueVector = literalsToVector(valueTypeCase, childSize, literal, valueAtFunc);
+  auto keyVector = literalsToVector(keyLiteral, childSize, keyAtFunc);
+  auto valueVector = literalsToVector(valueLiteral, childSize, valueAtFunc);
   return makeMapVector(keyVector, valueVector);
 }
 
 VectorPtr SubstraitVeloxExprConverter::literalsToVector(
-    ::substrait::Expression_Literal::LiteralTypeCase childTypeCase,
+    const ::substrait::Expression::Literal& childLiteral,
     vector_size_t childSize,
-    const ::substrait::Expression::Literal& literal,
     std::function<::substrait::Expression::Literal(vector_size_t /* idx */)> elementAtFunc) {
+  auto childTypeCase = childLiteral.literal_type_case();
   switch (childTypeCase) {
     case ::substrait::Expression_Literal::LiteralTypeCase::kNull: {
-      auto veloxType = SubstraitParser::parseType(literal.null());
+      auto veloxType = SubstraitParser::parseType(childLiteral.null());
       auto kind = veloxType->kind();
-      return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(constructFlatVector, kind, elementAtFunc, childSize, veloxType, pool_);
+      return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH_ALL(
+          constructFlatVector, kind, elementAtFunc, childSize, veloxType, pool_);
     }
     case ::substrait::Expression_Literal::LiteralTypeCase::kIntervalDayToSecond:
       return constructFlatVector<TypeKind::BIGINT>(elementAtFunc, childSize, INTERVAL_DAY_TIME(), pool_);
@@ -531,6 +464,15 @@ VectorPtr SubstraitVeloxExprConverter::literalsToVector(
       }
       return rowVector;
     }
+    case ::substrait::Expression_Literal::LiteralTypeCase::kEmptyList: {
+      auto elementType = SubstraitParser::parseType(childLiteral.empty_list().type());
+      return BaseVector::wrapInConstant(1, 0, makeEmptyArrayVector(pool_, elementType));
+    }
+    case ::substrait::Expression_Literal::LiteralTypeCase::kEmptyMap: {
+      auto keyType = SubstraitParser::parseType(childLiteral.empty_map().key());
+      auto valueType = SubstraitParser::parseType(childLiteral.empty_map().value());
+      return BaseVector::wrapInConstant(1, 0, makeEmptyMapVector(pool_, keyType, valueType));
+    }
     default:
       auto veloxType = getScalarType(elementAtFunc(0));
       if (veloxType) {
@@ -538,7 +480,7 @@ VectorPtr SubstraitVeloxExprConverter::literalsToVector(
         return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
             constructFlatVector, kind, elementAtFunc, childSize, veloxType, pool_);
       }
-      VELOX_NYI("literals not supported for type case '{}'", childTypeCase);
+      VELOX_NYI("literals not supported for type case '{}'", std::to_string(childTypeCase));
   }
 }
 
@@ -584,7 +526,7 @@ RowVectorPtr SubstraitVeloxExprConverter::literalsToRowVector(const ::substrait:
               VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(constructFlatVectorForStruct, kind, child, 1, veloxType, pool_);
           vectors.emplace_back(vecPtr);
         } else {
-          VELOX_NYI("literalsToRowVector not supported for type case '{}'", typeCase);
+          VELOX_NYI("literalsToRowVector not supported for type case '{}'", std::to_string(typeCase));
         }
     }
   }
@@ -638,7 +580,6 @@ core::TypedExprPtr SubstraitVeloxExprConverter::toVeloxExpr(
 core::TypedExprPtr SubstraitVeloxExprConverter::toVeloxExpr(
     const ::substrait::Expression& substraitExpr,
     const RowTypePtr& inputType) {
-  core::TypedExprPtr veloxExpr;
   auto typeCase = substraitExpr.rex_type_case();
   switch (typeCase) {
     case ::substrait::Expression::RexTypeCase::kLiteral:
@@ -654,7 +595,7 @@ core::TypedExprPtr SubstraitVeloxExprConverter::toVeloxExpr(
     case ::substrait::Expression::RexTypeCase::kSingularOrList:
       return toVeloxExpr(substraitExpr.singular_or_list(), inputType);
     default:
-      VELOX_NYI("Substrait conversion not supported for Expression '{}'", typeCase);
+      VELOX_NYI("Substrait conversion not supported for Expression '{}'", std::to_string(typeCase));
   }
 }
 
@@ -665,6 +606,7 @@ std::unordered_map<std::string, std::string> SubstraitVeloxExprConverter::extrac
     {"HOUR", "hour"},
     {"DAY", "day"},
     {"DAY_OF_WEEK", "dayofweek"},
+    {"WEEK_DAY", "weekday"},
     {"DAY_OF_YEAR", "dayofyear"},
     {"MONTH", "month"},
     {"QUARTER", "quarter"},

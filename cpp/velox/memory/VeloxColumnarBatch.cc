@@ -45,10 +45,9 @@ RowVectorPtr makeRowVector(
 } // namespace
 
 void VeloxColumnarBatch::ensureFlattened() {
-  if (flattened_ != nullptr) {
+  if (flattened_) {
     return;
   }
-
   ScopedTimer timer(&exportNanos_);
   for (auto& child : rowVector_->children()) {
     facebook::velox::BaseVector::flattenVector(child);
@@ -56,38 +55,40 @@ void VeloxColumnarBatch::ensureFlattened() {
       child = child->as<facebook::velox::LazyVector>()->loadedVectorShared();
       VELOX_DCHECK_NOT_NULL(child);
     }
+    // In case of output from Limit, RowVector size can be smaller than its children size.
+    if (child->size() > rowVector_->size()) {
+      child->resize(rowVector_->size());
+    }
   }
-  // Invalid the original rowVector_ after being flattened.
-  flattened_ = std::move(rowVector_);
+  flattened_ = true;
 }
 
 std::shared_ptr<ArrowSchema> VeloxColumnarBatch::exportArrowSchema() {
   auto out = std::make_shared<ArrowSchema>();
   ensureFlattened();
-  velox::exportToArrow(flattened_, *out, ArrowUtils::getBridgeOptions());
+  velox::exportToArrow(rowVector_, *out, ArrowUtils::getBridgeOptions());
   return out;
 }
 
 std::shared_ptr<ArrowArray> VeloxColumnarBatch::exportArrowArray() {
   auto out = std::make_shared<ArrowArray>();
   ensureFlattened();
-  velox::exportToArrow(flattened_, *out, flattened_->pool(), ArrowUtils::getBridgeOptions());
+  velox::exportToArrow(rowVector_, *out, rowVector_->pool(), ArrowUtils::getBridgeOptions());
   return out;
 }
 
 int64_t VeloxColumnarBatch::numBytes() {
   ensureFlattened();
-  return flattened_->estimateFlatSize();
+  return rowVector_->estimateFlatSize();
 }
 
 velox::RowVectorPtr VeloxColumnarBatch::getRowVector() const {
-  VELOX_CHECK_NOT_NULL(rowVector_);
   return rowVector_;
 }
 
 velox::RowVectorPtr VeloxColumnarBatch::getFlattenedRowVector() {
   ensureFlattened();
-  return flattened_;
+  return rowVector_;
 }
 
 std::shared_ptr<VeloxColumnarBatch> VeloxColumnarBatch::from(
@@ -117,8 +118,7 @@ std::shared_ptr<VeloxColumnarBatch> VeloxColumnarBatch::from(
     auto compositeVeloxVector = makeRowVector(childNames, childVectors, cb->numRows(), pool);
     return std::make_shared<VeloxColumnarBatch>(compositeVeloxVector);
   }
-  auto vp = velox::importFromArrowAsOwner(
-      *cb->exportArrowSchema(), *cb->exportArrowArray(), ArrowUtils::getBridgeOptions(), pool);
+  auto vp = velox::importFromArrowAsOwner(*cb->exportArrowSchema(), *cb->exportArrowArray(), pool);
   return std::make_shared<VeloxColumnarBatch>(std::dynamic_pointer_cast<velox::RowVector>(vp));
 }
 

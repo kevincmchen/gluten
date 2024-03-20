@@ -42,17 +42,12 @@ public class NativePlanEvaluator {
 
   private final PlanEvaluatorJniWrapper jniWrapper;
 
-  private NativePlanEvaluator(Runtime runtime) {
-    jniWrapper = PlanEvaluatorJniWrapper.forRuntime(runtime);
+  private NativePlanEvaluator() {
+    jniWrapper = PlanEvaluatorJniWrapper.create();
   }
 
   public static NativePlanEvaluator create() {
-    return new NativePlanEvaluator(Runtimes.contextInstance());
-  }
-
-  public static NativePlanEvaluator createForValidation(Runtime runtime) {
-    // Driver side doesn't have context instance of Runtime
-    return new NativePlanEvaluator(runtime);
+    return new NativePlanEvaluator();
   }
 
   public NativePlanValidationInfo doNativeValidateWithFailureReason(byte[] subPlan) {
@@ -66,7 +61,7 @@ public class NativePlanEvaluator {
   // Used by WholeStageTransform to create the native computing pipeline and
   // return a columnar result iterator.
   public GeneralOutIterator createKernelWithBatchIterator(
-      byte[] wsPlan, byte[][] splitInfo, List<GeneralInIterator> iterList)
+      byte[] wsPlan, byte[][] splitInfo, List<GeneralInIterator> iterList, int partitionIndex)
       throws RuntimeException, IOException {
     final AtomicReference<ColumnarBatchOutIterator> outIterator = new AtomicReference<>();
     final NativeMemoryManager nmm =
@@ -106,7 +101,7 @@ public class NativePlanEvaluator {
             splitInfo,
             iterList.toArray(new GeneralInIterator[0]),
             TaskContext.get().stageId(),
-            TaskContext.getPartitionId(),
+            partitionIndex, // TaskContext.getPartitionId(),
             TaskContext.get().taskAttemptId(),
             DebugUtil.saveInputToFile(),
             BackendsApiManager.getSparkPlanExecApiInstance().rewriteSpillPath(spillDirPath));

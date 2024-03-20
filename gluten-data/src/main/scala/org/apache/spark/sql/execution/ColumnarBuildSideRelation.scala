@@ -18,29 +18,25 @@ package org.apache.spark.sql.execution
 
 import io.glutenproject.columnarbatch.ColumnarBatches
 import io.glutenproject.exec.Runtimes
-import io.glutenproject.execution.BroadCastHashJoinContext
 import io.glutenproject.memory.arrowalloc.ArrowBufferAllocators
 import io.glutenproject.memory.nmm.NativeMemoryManagers
+import io.glutenproject.sql.shims.SparkShimLoader
 import io.glutenproject.utils.{ArrowAbiUtil, Iterators}
 import io.glutenproject.vectorized.{ColumnarBatchSerializerJniWrapper, NativeColumnarToRowJniWrapper}
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, BoundReference, Expression, UnsafeProjection, UnsafeRow}
-import org.apache.spark.sql.catalyst.plans.physical.BroadcastMode
 import org.apache.spark.sql.execution.joins.BuildSideRelation
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.utils.SparkArrowUtil
 import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.util.TaskResources
 
 import org.apache.arrow.c.ArrowSchema
 
 import scala.collection.JavaConverters.asScalaIteratorConverter
 
-case class ColumnarBuildSideRelation(
-    mode: BroadcastMode,
-    output: Seq[Attribute],
-    batches: Array[Array[Byte]])
+case class ColumnarBuildSideRelation(output: Seq[Attribute], batches: Array[Array[Byte]])
   extends BuildSideRelation {
 
   override def deserialized: Iterator[ColumnarBatch] = {
@@ -49,7 +45,7 @@ case class ColumnarBuildSideRelation(
       val allocator = ArrowBufferAllocators.contextInstance()
       val cSchema = ArrowSchema.allocateNew(allocator)
       val arrowSchema = SparkArrowUtil.toArrowSchema(
-        StructType.fromAttributes(output),
+        SparkShimLoader.getSparkShims.structFromAttributes(output),
         SQLConf.get.sessionLocalTimeZone)
       ArrowAbiUtil.exportSchema(allocator, arrowSchema, cSchema)
       val handle = jniWrapper
@@ -85,23 +81,22 @@ case class ColumnarBuildSideRelation(
       .create()
   }
 
-  override def asReadOnlyCopy(
-      broadCastContext: BroadCastHashJoinContext): ColumnarBuildSideRelation = this
+  override def asReadOnlyCopy(): ColumnarBuildSideRelation = this
 
   /**
    * Transform columnar broadcast value to Array[InternalRow] by key and distinct. NOTE: This method
    * was called in Spark Driver, should manage resources carefully.
    */
-  override def transform(key: Expression): Array[InternalRow] = {
+  override def transform(key: Expression): Array[InternalRow] = TaskResources.runUnsafe {
     // This transformation happens in Spark driver, thus resources can not be managed automatically.
-    val runtime = Runtimes.tmpInstance()
-    val nativeMemoryManager = NativeMemoryManagers.tmpInstance("BuildSideRelation#transform")
-    val serializerJniWrapper = ColumnarBatchSerializerJniWrapper.forRuntime(runtime)
+    val runtime = Runtimes.contextInstance()
+    val nativeMemoryManager = NativeMemoryManagers.contextInstance("BuildSideRelation#transform")
+    val serializerJniWrapper = ColumnarBatchSerializerJniWrapper.create()
     val serializeHandle = {
-      val allocator = ArrowBufferAllocators.globalInstance()
+      val allocator = ArrowBufferAllocators.contextInstance()
       val cSchema = ArrowSchema.allocateNew(allocator)
       val arrowSchema = SparkArrowUtil.toArrowSchema(
-        StructType.fromAttributes(output),
+        SparkShimLoader.getSparkShims.structFromAttributes(output),
         SQLConf.get.sessionLocalTimeZone)
       ArrowAbiUtil.exportSchema(allocator, arrowSchema, cSchema)
       val handle = serializerJniWrapper
@@ -113,7 +108,7 @@ case class ColumnarBuildSideRelation(
     var closed = false
 
     // Convert columnar to Row.
-    val jniWrapper = NativeColumnarToRowJniWrapper.forRuntime(runtime)
+    val jniWrapper = NativeColumnarToRowJniWrapper.create()
     val c2rId = jniWrapper.nativeColumnarToRowInit(nativeMemoryManager.getNativeInstanceHandle)
     var batchId = 0
     val iterator = if (batches.length > 0) {
@@ -123,8 +118,6 @@ case class ColumnarBuildSideRelation(
           if (!itHasNext && !closed) {
             jniWrapper.nativeClose(c2rId)
             serializerJniWrapper.close(serializeHandle)
-            runtime.release()
-            nativeMemoryManager.release()
             closed = true
           }
           itHasNext

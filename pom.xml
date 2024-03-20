@@ -20,7 +20,7 @@
   <packaging>pom</packaging>
 
   <name>Gluten Parent Pom</name>
-  <url>https://github.com/oap-project/gluten.git</url>
+  <url>https://github.com/apache/incubator-gluten.git</url>
 
   <licenses>
     <license>
@@ -34,7 +34,6 @@
     <module>gluten-ui</module>
     <module>package</module>
     <module>shims</module>
-    <module>substrait/substrait-spark</module>
   </modules>
 
   <properties>
@@ -48,7 +47,7 @@
     <sparkbundle.version>3.2</sparkbundle.version>
     <spark.version>3.4.2</spark.version>
     <sparkshim.artifactId>spark-sql-columnar-shims-spark32</sparkshim.artifactId>
-    <celeborn.version>0.3.0-incubating</celeborn.version>
+    <celeborn.version>0.3.2-incubating</celeborn.version>
     <arrow.version>14.0.1</arrow.version>
     <arrow-memory.artifact>arrow-memory-unsafe</arrow-memory.artifact>
     <hadoop.version>2.7.4</hadoop.version>
@@ -68,7 +67,6 @@
     <!-- Package name to use when relocating shaded classes -->
     <gluten.shade.packageName>io.glutenproject.shaded</gluten.shade.packageName>
 
-    <substrait.version>0.24.0</substrait.version>
     <!-- The original protobuf version -->
     <protobuf.version>3.23.4</protobuf.version>
     <!-- The custom protobuf version (based on 3.23.4) with recursion limit enlarged. -->
@@ -141,6 +139,16 @@
       </properties>
     </profile>
     <profile>
+      <id>spark-3.5</id>
+      <properties>
+        <sparkbundle.version>3.5</sparkbundle.version>
+        <sparkshim.artifactId>spark-sql-columnar-shims-spark35</sparkshim.artifactId>
+        <spark.version>3.5.1</spark.version>
+        <delta.version>2.4.0</delta.version>
+        <delta.binary.version>24</delta.binary.version>
+      </properties>
+    </profile>
+    <profile>
       <id>hadoop-2.7.4</id>
       <properties>
         <hadoop.version>2.7.4</hadoop.version>
@@ -159,9 +167,9 @@
       </properties>
     </profile>
     <profile>
-      <id>dataproc-2.0</id>
+      <id>dataproc-2.2</id>
       <properties>
-        <hadoop.version>3.2.2</hadoop.version>
+        <hadoop.version>3.3.6</hadoop.version>
       </properties>
     </profile>
     <profile>
@@ -231,8 +239,6 @@
       </modules>
       <properties>
         <backend_type>velox</backend_type>
-        <arrow.version>14.0.1</arrow.version>
-        <build_velox_backend>ON</build_velox_backend>
       </properties>
     </profile>
     <profile>
@@ -343,21 +349,6 @@
         <artifactId>spark-yarn_${scala.binary.version}</artifactId>
         <version>${spark.version}</version>
         <scope>provided</scope>
-      </dependency>
-      <dependency>
-        <groupId>io.substrait</groupId>
-        <artifactId>core</artifactId>
-        <version>${substrait.version}</version>
-        <exclusions>
-          <exclusion>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-jdk14</artifactId>
-          </exclusion>
-          <exclusion>
-            <groupId>com.google.protobuf</groupId>
-            <artifactId>protobuf-java</artifactId>
-          </exclusion>
-        </exclusions>
       </dependency>
       <!-- test dependencies -->
       <dependency>

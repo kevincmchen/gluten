@@ -21,15 +21,14 @@ import io.glutenproject.sql.shims.SparkShimLoader
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row}
-import org.apache.spark.sql.execution.{GenerateExec, RDDScanExec}
-import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+import org.apache.spark.sql.execution.{FilterExec, GenerateExec, ProjectExec, RDDScanExec}
 import org.apache.spark.sql.functions.{avg, col, lit, udf}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{DecimalType, StringType, StructField, StructType}
 
 import scala.collection.JavaConverters
 
-class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPlanHelper {
+class TestOperator extends VeloxWholeStageTransformerSuite {
 
   protected val rootPath: String = getClass.getResource("/").getPath
   override protected val backend: String = "velox"
@@ -51,7 +50,7 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
       .set("spark.memory.offHeap.size", "2g")
       .set("spark.unsafe.exceptionOnMemoryLeak", "true")
       .set("spark.sql.autoBroadcastJoinThreshold", "-1")
-      .set("spark.sql.sources.useV1SourceList", "avro")
+      .set("spark.sql.sources.useV1SourceList", "avro,parquet")
   }
 
   test("simple_select") {
@@ -213,6 +212,12 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
       windowType =>
         withSQLConf("spark.gluten.sql.columnar.backend.velox.window.type" -> windowType) {
           runQueryAndCompare(
+            "select ntile(4) over" +
+              " (partition by l_suppkey order by l_orderkey) from lineitem ") {
+            assertWindowOffloaded
+          }
+
+          runQueryAndCompare(
             "select row_number() over" +
               " (partition by l_suppkey order by l_orderkey) from lineitem ") {
             assertWindowOffloaded
@@ -268,6 +273,18 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
 
           runQueryAndCompare(
             "select avg(l_partkey) over" +
+              " (partition by l_suppkey order by l_orderkey) from lineitem ") {
+            assertWindowOffloaded
+          }
+
+          runQueryAndCompare(
+            "select lag(l_orderkey) over" +
+              " (partition by l_suppkey order by l_orderkey) from lineitem ") {
+            assertWindowOffloaded
+          }
+
+          runQueryAndCompare(
+            "select lead(l_orderkey) over" +
               " (partition by l_suppkey order by l_orderkey) from lineitem ") {
             assertWindowOffloaded
           }
@@ -383,8 +400,7 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
                          |""".stripMargin) {
       df =>
         {
-          getExecutedPlan(df).exists(
-            plan => plan.find(_.isInstanceOf[UnionExecTransformer]).isDefined)
+          getExecutedPlan(df).exists(plan => plan.find(_.isInstanceOf[ColumnarUnionExec]).isDefined)
         }
     }
   }
@@ -401,8 +417,7 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
                          |""".stripMargin) {
       df =>
         {
-          getExecutedPlan(df).exists(
-            plan => plan.find(_.isInstanceOf[UnionExecTransformer]).isDefined)
+          getExecutedPlan(df).exists(plan => plan.find(_.isInstanceOf[ColumnarUnionExec]).isDefined)
         }
     }
   }
@@ -417,8 +432,7 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
                                   |""".stripMargin) {
       df =>
         {
-          getExecutedPlan(df).exists(
-            plan => plan.find(_.isInstanceOf[UnionExecTransformer]).isDefined)
+          getExecutedPlan(df).exists(plan => plan.find(_.isInstanceOf[ColumnarUnionExec]).isDefined)
         }
     }
   }
@@ -450,7 +464,7 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
           .parquet(path.getCanonicalPath)
         spark.read.parquet(path.getCanonicalPath).createOrReplaceTempView("view")
         runQueryAndCompare("SELECT a from view") {
-          checkOperatorMatch[BatchScanExecTransformer]
+          checkOperatorMatch[FileSourceScanExecTransformer]
         }
     }
   }
@@ -632,14 +646,20 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
   }
 
   test("Support get native plan tree string, Velox single aggregation") {
-    runQueryAndCompare("select l_partkey + 1, count(*) from lineitem group by l_partkey + 1") {
+    runQueryAndCompare("""
+                         |select l_partkey + 1, count(*)
+                         |from (select /*+ repartition(2) */ * from lineitem) group by l_partkey + 1
+                         |""".stripMargin) {
       df =>
         val wholeStageTransformers = collect(df.queryExecution.executedPlan) {
           case w: WholeStageTransformer => w
         }
+        assert(wholeStageTransformers.size == 3)
         val nativePlanString = wholeStageTransformers.head.nativePlanString()
         assert(nativePlanString.contains("Aggregation[SINGLE"))
-        assert(nativePlanString.contains("TableScan"))
+        assert(nativePlanString.contains("ValueStream"))
+        assert(wholeStageTransformers(1).nativePlanString().contains("ValueStream"))
+        assert(wholeStageTransformers.last.nativePlanString().contains("TableScan"))
     }
   }
 
@@ -694,27 +714,125 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
     }
   }
 
-  test("test explode function") {
-    runQueryAndCompare("""
-                         |SELECT explode(array(1, 2, 3));
-                         |""".stripMargin) {
-      checkOperatorMatch[GenerateExecTransformer]
+  test("test explode/posexplode function") {
+    Seq("explode", "posexplode").foreach {
+      func =>
+        // Literal: func(literal)
+        runQueryAndCompare(s"""
+                              |SELECT $func(array(1, 2, 3));
+                              |""".stripMargin) {
+          checkOperatorMatch[GenerateExecTransformer]
+        }
+        runQueryAndCompare(s"""
+                              |SELECT $func(map(1, 'a', 2, 'b'));
+                              |""".stripMargin) {
+          checkOperatorMatch[GenerateExecTransformer]
+        }
+        runQueryAndCompare(
+          s"""
+             |SELECT $func(array(map(1, 'a', 2, 'b'), map(3, 'c', 4, 'd'), map(5, 'e', 6, 'f')));
+             |""".stripMargin) {
+          checkOperatorMatch[GenerateExecTransformer]
+        }
+        runQueryAndCompare(s"""
+                              |SELECT $func(map(1, array(1, 2), 2, array(3, 4)));
+                              |""".stripMargin) {
+          checkOperatorMatch[GenerateExecTransformer]
+        }
+
+        // CreateArray/CreateMap: func(array(col)), func(map(k, v))
+        withTempView("t1") {
+          sql("""select * from values (1), (2), (3), (4)
+                |as tbl(a)
+         """.stripMargin).createOrReplaceTempView("t1")
+          runQueryAndCompare(s"""
+                                |SELECT $func(array(a)) from t1;
+                                |""".stripMargin) {
+            checkOperatorMatch[GenerateExecTransformer]
+          }
+          sql("""select * from values (1, 'a'), (2, 'b'), (3, null), (4, null)
+                |as tbl(a, b)
+         """.stripMargin).createOrReplaceTempView("t1")
+          runQueryAndCompare(s"""
+                                |SELECT $func(map(a, b)) from t1;
+                                |""".stripMargin) {
+            checkOperatorMatch[GenerateExecTransformer]
+          }
+        }
+
+        // AttributeReference: func(col)
+        withTempView("t2") {
+          sql("""select * from values
+                |  array(1, 2, 3),
+                |  array(4, null)
+                |as tbl(a)
+         """.stripMargin).createOrReplaceTempView("t2")
+          runQueryAndCompare(s"""
+                                |SELECT $func(a) from t2;
+                                |""".stripMargin) {
+            checkOperatorMatch[GenerateExecTransformer]
+          }
+          sql("""select * from values
+                |  map(1, 'a', 2, 'b', 3, null),
+                |  map(4, null)
+                |as tbl(a)
+         """.stripMargin).createOrReplaceTempView("t2")
+          runQueryAndCompare(s"""
+                                |SELECT $func(a) from t2;
+                                |""".stripMargin) {
+            checkOperatorMatch[GenerateExecTransformer]
+          }
+        }
     }
-    runQueryAndCompare("""
-                         |SELECT explode(map(1, 'a', 2, 'b'));
-                         |""".stripMargin) {
-      checkOperatorMatch[GenerateExecTransformer]
+  }
+
+  test("test inline function") {
+    withTempView("t1") {
+      sql("""select * from values
+            |  array(
+            |    named_struct('c1', 0, 'c2', 1),
+            |    null,
+            |    named_struct('c1', 2, 'c2', 3)
+            |  ),
+            |  array(
+            |    null,
+            |    named_struct('c1', 0, 'c2', 1),
+            |    named_struct('c1', 2, 'c2', 3)
+            |  )
+            |as tbl(a)
+         """.stripMargin).createOrReplaceTempView("t1")
+      runQueryAndCompare("""
+                           |SELECT inline(a) from t1;
+                           |""".stripMargin) {
+        checkOperatorMatch[GenerateExecTransformer]
+      }
     }
-    runQueryAndCompare(
-      """
-        |SELECT explode(array(map(1, 'a', 2, 'b'), map(3, 'c', 4, 'd'), map(5, 'e', 6, 'f')));
-        |""".stripMargin) {
-      checkOperatorMatch[GenerateExecTransformer]
-    }
-    runQueryAndCompare("""
-                         |SELECT explode(map(1, array(1, 2), 2, array(3, 4)));
-                         |""".stripMargin) {
-      checkOperatorMatch[GenerateExecTransformer]
+  }
+
+  test("test array functions") {
+    withTable("t") {
+      sql("CREATE TABLE t (c1 ARRAY<INT>, c2 ARRAY<INT>, c3 STRING) using parquet")
+      sql("INSERT INTO t VALUES (ARRAY(0, 1, 2, 3, 3), ARRAY(2, 2, 3, 4, 6), 'abc')")
+      runQueryAndCompare("""
+                           |SELECT array_except(c1, c2) FROM t;
+                           |""".stripMargin) {
+        checkOperatorMatch[ProjectExecTransformer]
+      }
+      runQueryAndCompare("""
+                           |SELECT array_distinct(c1), array_distinct(c2) FROM t;
+                           |""".stripMargin) {
+        checkOperatorMatch[ProjectExecTransformer]
+      }
+      runQueryAndCompare("""
+                           |SELECT array_position(c1, 3), array_position(c2, 2) FROM t;
+                           |""".stripMargin) {
+        checkOperatorMatch[ProjectExecTransformer]
+      }
+      runQueryAndCompare("""
+                           |SELECT array_repeat(c3, 5) FROM t;
+                           |""".stripMargin) {
+        checkOperatorMatch[ProjectExecTransformer]
+      }
     }
   }
 
@@ -782,7 +900,29 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
     }
   }
 
-  test("test cross join with equi join conditions") {
+  test("Fallback on timestamp column filter") {
+    withTable("ts") {
+      sql("create table ts (c1 int, c2 timestamp) using parquet")
+      sql("insert into ts values (1, timestamp'2016-01-01 10:11:12.123456')")
+      sql("insert into ts values (2, null)")
+      sql("insert into ts values (3, timestamp'1965-01-01 10:11:12.123456')")
+
+      runQueryAndCompare("select c1, c2 from ts where c1 = 1") {
+        checkOperatorMatch[FileSourceScanExecTransformer]
+      }
+
+      // Fallback should only happen when there is a filter on timestamp column
+      runQueryAndCompare(
+        "select c1, c2 from ts where" +
+          " c2 = timestamp'1965-01-01 10:11:12.123456'") { _ => }
+
+      runQueryAndCompare(
+        "select c1, c2 from ts where" +
+          " c1 = 1 and c2 = timestamp'1965-01-01 10:11:12.123456'") { _ => }
+    }
+  }
+
+  test("test cross join") {
     withTable("t1", "t2") {
       sql("""
             |create table t1 using parquet as
@@ -807,7 +947,7 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
             |select * from t1 cross join t2 on t1.c1 = t2.c1;
             |""".stripMargin
         ) {
-          checkOperatorMatch[GlutenBroadcastHashJoinExecTransformer]
+          checkOperatorMatch[BroadcastHashJoinExecTransformer]
         }
       }
 
@@ -818,6 +958,32 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
             |""".stripMargin
         ) {
           checkOperatorMatch[SortMergeJoinExecTransformer]
+        }
+      }
+
+      runQueryAndCompare(
+        """
+          |select * from t1 cross join t2;
+          |""".stripMargin
+      ) {
+        checkOperatorMatch[CartesianProductExecTransformer]
+      }
+
+      runQueryAndCompare(
+        """
+          |select * from t1 cross join t2 on t1.c1 > t2.c1;
+          |""".stripMargin
+      ) {
+        checkOperatorMatch[CartesianProductExecTransformer]
+      }
+
+      withSQLConf("spark.sql.autoBroadcastJoinThreshold" -> "1MB") {
+        runQueryAndCompare(
+          """
+            |select * from t1 cross join t2 on 2*t1.c1 > 3*t2.c1;
+            |""".stripMargin
+        ) {
+          checkOperatorMatch[BroadcastNestedLoopJoinExecTransformer]
         }
       }
     }
@@ -840,7 +1006,7 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
 
     spark.read.format("parquet").load(path).createOrReplaceTempView("test")
     runQueryAndCompare("select * from test") {
-      checkOperatorMatch[BatchScanExecTransformer]
+      checkOperatorMatch[FileSourceScanExecTransformer]
     }
   }
 
@@ -852,6 +1018,244 @@ class TestOperator extends VeloxWholeStageTransformerSuite with AdaptiveSparkPla
         runQueryAndCompare(
           "SELECT x FROM view WHERE cast(x as timestamp) " +
             "IN ('1970-01-01 08:00:00.001','1970-01-01 08:00:00.2')")(_)
+    }
+  }
+
+  test("Columnar cartesian product with other join") {
+    withTable("cartesian1", "cartesian2") {
+      spark.sql("""
+                  |CREATE TABLE cartesian1 USING PARQUET
+                  |AS SELECT id as c1, id % 3 as c2 FROM range(20)
+                  |""".stripMargin)
+      spark.sql("""
+                  |CREATE TABLE cartesian2 USING PARQUET
+                  |AS SELECT id as c1, id % 3 as c2 FROM range(20)
+                  |""".stripMargin)
+
+      runQueryAndCompare(
+        """
+          |SELECT * FROM (
+          | SELECT /*+ shuffle_replicate_nl(cartesian1) */ cartesian1.c1, cartesian2.c2
+          | FROM cartesian1 join cartesian2
+          |)tmp
+          |join cartesian2 on tmp.c1 = cartesian2.c1
+          |""".stripMargin)(df => checkFallbackOperators(df, 0))
+    }
+  }
+
+  test("Support multi-children count") {
+    runQueryAndCompare(
+      """
+        |select l_orderkey, count(distinct l_partkey, l_comment)
+        |from lineitem group by l_orderkey
+        |""".stripMargin
+    )(df => checkFallbackOperators(df, 0))
+
+    runQueryAndCompare(
+      """
+        |select l_orderkey, count(l_shipdate, l_comment)
+        |from lineitem group by l_orderkey
+        |""".stripMargin
+    )(df => checkFallbackOperators(df, 0))
+
+    runQueryAndCompare(
+      """
+        |select l_orderkey, count(distinct l_partkey, l_comment), count(l_shipdate, l_comment)
+        |from lineitem group by l_orderkey
+        |""".stripMargin
+    )(df => checkFallbackOperators(df, 0))
+
+    runQueryAndCompare(
+      """
+        |select l_orderkey, count(distinct l_partkey), count(l_shipdate, l_comment)
+        |from lineitem group by l_orderkey
+        |""".stripMargin
+    )(df => checkFallbackOperators(df, 0))
+
+    runQueryAndCompare(
+      """
+        |select l_orderkey, count(distinct l_partkey, l_comment), count(l_shipdate)
+        |from lineitem group by l_orderkey
+        |""".stripMargin
+    )(df => checkFallbackOperators(df, 0))
+  }
+
+  test("Support multi-children count with row construct") {
+    runQueryAndCompare(
+      """
+        |select l_orderkey, count(distinct l_partkey, l_comment), corr(l_partkey, l_partkey+1)
+        |from lineitem group by l_orderkey
+        |""".stripMargin
+    )(df => checkFallbackOperators(df, 0))
+  }
+
+  test("Remainder with non-foldable right side") {
+    withTable("remainder") {
+      spark.sql("""
+                  |CREATE TABLE remainder USING PARQUET
+                  |AS SELECT id as c1, id % 3 as c2 FROM range(3)
+                  |""".stripMargin)
+      spark.sql("INSERT INTO TABLE remainder VALUES(0, null)")
+
+      runQueryAndCompare("SELECT c1 % c2 FROM remainder")(df => checkFallbackOperators(df, 0))
+    }
+  }
+
+  test("Support HOUR function") {
+    withTable("t1") {
+      sql("create table t1 (c1 int, c2 timestamp) USING PARQUET")
+      sql("INSERT INTO t1 VALUES(1, NOW())")
+      runQueryAndCompare("SELECT c1, HOUR(c2) FROM t1 LIMIT 1")(df => checkFallbackOperators(df, 0))
+    }
+  }
+
+  test("Support Array type signature") {
+    withTable("t1", "t2") {
+      sql("CREATE TABLE t1(id INT, l ARRAY<INT>) USING PARQUET")
+      sql("INSERT INTO t1 VALUES(1, ARRAY(1, 2)), (2, ARRAY(3, 4))")
+      runQueryAndCompare("SELECT first(l) FROM t1")(df => checkFallbackOperators(df, 0))
+
+      sql("CREATE TABLE t2(id INT, l ARRAY<STRUCT<k: INT, v: INT>>) USING PARQUET")
+      sql("INSERT INTO t2 VALUES(1, ARRAY(STRUCT(1, 100))), (2, ARRAY(STRUCT(2, 200)))")
+      runQueryAndCompare("SELECT first(l) FROM t2")(df => checkFallbackOperators(df, 1))
+    }
+  }
+
+  test("Fall back multiple expressions") {
+    runQueryAndCompare(
+      """
+        |select (l_partkey % 10 + 5)
+        |from lineitem
+        |""".stripMargin
+    )(checkOperatorMatch[ProjectExecTransformer])
+
+    runQueryAndCompare(
+      """
+        |select l_partkey
+        |from lineitem where (l_partkey % 10 + 5) > 6
+        |""".stripMargin
+    )(checkOperatorMatch[FilterExecTransformer])
+
+    withSQLConf(GlutenConfig.COLUMNAR_FALLBACK_EXPRESSIONS_THRESHOLD.key -> "2") {
+      runQueryAndCompare(
+        """
+          |select (l_partkey % 10 + 5)
+          |from lineitem
+          |""".stripMargin
+      )(checkFallbackOperatorMatch[ProjectExec])
+
+      runQueryAndCompare(
+        """
+          |select l_partkey
+          |from lineitem where (l_partkey % 10 + 5) > 6
+          |""".stripMargin
+      )(checkFallbackOperatorMatch[FilterExec])
+    }
+  }
+
+  test("test array literal") {
+    withTable("array_table") {
+      sql("create table array_table(a array<bigint>) using parquet")
+      sql("insert into table array_table select array(1)")
+      runQueryAndCompare("select size(coalesce(a, array())) from array_table") {
+        df =>
+          {
+            assert(getExecutedPlan(df).count(_.isInstanceOf[ProjectExecTransformer]) == 1)
+          }
+      }
+    }
+  }
+
+  test("test map literal") {
+    withTable("map_table") {
+      sql("create table map_table(a map<bigint, string>) using parquet")
+      sql("insert into table map_table select map(1, 'hello')")
+      runQueryAndCompare("select size(coalesce(a, map())) from map_table") {
+        df =>
+          {
+            assert(getExecutedPlan(df).count(_.isInstanceOf[ProjectExecTransformer]) == 1)
+          }
+      }
+    }
+  }
+
+  test("Support In list option contains non-foldable expression") {
+    runQueryAndCompare(
+      """
+        |SELECT * FROM lineitem
+        |WHERE l_orderkey in (1, 2, l_partkey, l_suppkey, l_linenumber)
+        |""".stripMargin
+    )(df => checkFallbackOperators(df, 0))
+
+    runQueryAndCompare(
+      """
+        |SELECT * FROM lineitem
+        |WHERE l_orderkey in (1, 2, l_partkey - 1, l_suppkey, l_linenumber)
+        |""".stripMargin
+    )(df => checkFallbackOperators(df, 0))
+
+    runQueryAndCompare(
+      """
+        |SELECT * FROM lineitem
+        |WHERE l_orderkey not in (1, 2, l_partkey, l_suppkey, l_linenumber)
+        |""".stripMargin
+    )(df => checkFallbackOperators(df, 0))
+
+    runQueryAndCompare(
+      """
+        |SELECT * FROM lineitem
+        |WHERE l_orderkey in (l_partkey, l_suppkey, l_linenumber)
+        |""".stripMargin
+    )(df => checkFallbackOperators(df, 0))
+
+    runQueryAndCompare(
+      """
+        |SELECT * FROM lineitem
+        |WHERE l_orderkey in (l_partkey + 1, l_suppkey, l_linenumber)
+        |""".stripMargin
+    )(df => checkFallbackOperators(df, 0))
+
+    runQueryAndCompare(
+      """
+        |SELECT * FROM lineitem
+        |WHERE l_orderkey not in (l_partkey, l_suppkey, l_linenumber)
+        |""".stripMargin
+    )(df => checkFallbackOperators(df, 0))
+  }
+
+  test("Support StructType in HashAggregate") {
+    runQueryAndCompare("""
+                         |select s, count(1) from (
+                         |   select named_struct('id', cast(id as int),
+                         |   'id_str', cast(id as string)) as s from range(100)
+                         |) group by s
+                         |""".stripMargin) {
+      checkOperatorMatch[HashAggregateExecTransformer]
+    }
+  }
+
+  test("test roundrobine with sort") {
+    // scalastyle:off
+    runQueryAndCompare("SELECT /*+ REPARTITION(3) */ l_orderkey, l_partkey FROM lineitem") {
+      /*
+        ColumnarExchange RoundRobinPartitioning(3), REPARTITION_BY_NUM, [l_orderkey#16L, l_partkey#17L)
+        +- ^(2) ProjectExecTransformer [l_orderkey#16L, l_partkey#17L]
+          +- ^(2) SortExecTransformer [hash_partition_key#302 ASC NULLS FIRST], false, 0
+            +- ^(2) ProjectExecTransformer [hash(l_orderkey#16L, l_partkey#17L) AS hash_partition_key#302, l_orderkey#16L, l_partkey#17L]
+                +- ^(2) BatchScanExecTransformer[l_orderkey#16L, l_partkey#17L] ParquetScan DataFilters: [], Format: parquet, Location: InMemoryFileIndex(1 paths)[..., PartitionFilters: [], PushedFilters: [], ReadSchema: struct<l_orderkey:bigint,l_partkey:bigint>, PushedFilters: [] RuntimeFilters: []
+       */
+      checkOperatorMatch[SortExecTransformer]
+    }
+    // scalastyle:on
+
+    withSQLConf("spark.sql.execution.sortBeforeRepartition" -> "false") {
+      runQueryAndCompare("""SELECT /*+ REPARTITION(3) */
+                           | l_orderkey, l_partkey FROM lineitem""".stripMargin) {
+        df =>
+          {
+            assert(getExecutedPlan(df).count(_.isInstanceOf[SortExecTransformer]) == 0)
+          }
+      }
     }
   }
 }

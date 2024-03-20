@@ -30,14 +30,14 @@
 #include <Core/Defines.h>
 #include <Core/NamesAndTypes.h>
 #include <DataTypes/DataTypeArray.h>
-#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeMap.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/NestedUtils.h>
+#include <Disks/registerDisks.h>
 #include <Functions/FunctionFactory.h>
-#include <Functions/FunctionsConversion.h>
 #include <Functions/registerFunctions.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/SharedThreadPools.h>
@@ -49,6 +49,7 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <QueryPipeline/printPipeline.h>
 #include <Storages/Output/WriteBufferBuilder.h>
+#include <Storages/StorageMergeTreeFactory.h>
 #include <Storages/SubstraitSource/ReadBufferBuilder.h>
 #include <google/protobuf/util/json_util.h>
 #include <google/protobuf/wrappers.pb.h>
@@ -58,7 +59,7 @@
 #include <Common/Config/ConfigProcessor.h>
 #include <Common/CurrentThread.h>
 #include <Common/GlutenSignalHandler.h>
-#include <Common/Logger.h>
+#include <Common/LoggerExtend.h>
 #include <Common/logger_useful.h>
 #include <Common/typeid_cast.h>
 
@@ -67,14 +68,14 @@
 
 #include "CHUtil.h"
 
-#include <sys/resource.h>
 #include <unistd.h>
+#include <sys/resource.h>
 
 namespace DB
 {
 namespace ErrorCodes
 {
-    extern const int BAD_ARGUMENTS;
+extern const int BAD_ARGUMENTS;
 }
 }
 
@@ -302,7 +303,7 @@ size_t PODArrayUtil::adjustMemoryEfficientSize(size_t n)
     }
     else
     {
-        padded_n = rounded_n - padding_n;    
+        padded_n = rounded_n - padding_n;
     }
     return padded_n;
 }
@@ -324,9 +325,7 @@ std::string PlanUtil::explainPlan(DB::QueryPlan & plan)
 std::vector<MergeTreeUtil::Path> MergeTreeUtil::getAllMergeTreeParts(const Path & storage_path)
 {
     if (!fs::exists(storage_path))
-    {
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Invalid merge tree store path:{}", storage_path.string());
-    }
 
     // TODO: May need to check the storage format version
     std::vector<fs::path> res;
@@ -344,9 +343,7 @@ DB::NamesAndTypesList MergeTreeUtil::getSchemaFromMergeTreePart(const fs::path &
 {
     DB::NamesAndTypesList names_types_list;
     if (!fs::exists(part_path))
-    {
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Invalid merge tree store path:{}", part_path.string());
-    }
     DB::ReadBufferFromFile readbuffer((part_path / "columns.txt").string());
     names_types_list.readText(readbuffer);
     return names_types_list;
@@ -386,9 +383,7 @@ std::optional<DB::ColumnWithTypeAndName> NestedColumnExtractHelper::extractColum
 {
     auto table_iter = nested_tables.find(column_name_prefix);
     if (table_iter == nested_tables.end())
-    {
         return {};
-    }
 
     auto & nested_table = table_iter->second;
     auto nested_names = DB::Nested::splitName(column_name_suffix);
@@ -410,9 +405,7 @@ std::optional<DB::ColumnWithTypeAndName> NestedColumnExtractHelper::extractColum
 
     const auto * sub_col = findColumn(*nested_table, new_column_name_prefix);
     if (!sub_col)
-    {
         return {};
-    }
 
     DB::ColumnsWithTypeAndName columns = {*sub_col};
     DB::Block sub_block(columns);
@@ -429,9 +422,7 @@ const DB::ColumnWithTypeAndName * NestedColumnExtractHelper::findColumn(const DB
         const auto & cols = in_block.getColumnsWithTypeAndName();
         auto found = std::find_if(cols.begin(), cols.end(), [&](const auto & column) { return boost::iequals(column.name, name); });
         if (found == cols.end())
-        {
             return nullptr;
-        }
         return &*found;
     }
 
@@ -474,9 +465,7 @@ std::map<std::string, std::string> BackendInitializerUtil::getBackendConfMap(std
 {
     std::map<std::string, std::string> ch_backend_conf;
     if (plan == nullptr)
-    {
         return ch_backend_conf;
-    }
 
     /// Parse backend configs from plan extensions
     do
@@ -523,11 +512,10 @@ std::map<std::string, std::string> BackendInitializerUtil::getBackendConfMap(std
         }
     } while (false);
 
-    if (!ch_backend_conf.count(CH_RUNTIME_CONFIG_FILE))
+    if (!ch_backend_conf.contains(CH_RUNTIME_CONFIG_FILE))
     {
         /// Try to get config path from environment variable
-        const char * config_path = std::getenv("CLICKHOUSE_BACKEND_CONFIG"); /// NOLINT
-        if (config_path)
+        if (const char * config_path = std::getenv("CLICKHOUSE_BACKEND_CONFIG"))
             ch_backend_conf[CH_RUNTIME_CONFIG_FILE] = config_path;
     }
     return ch_backend_conf;
@@ -538,14 +526,14 @@ DB::Context::ConfigurationPtr BackendInitializerUtil::initConfig(std::map<std::s
     DB::Context::ConfigurationPtr config;
 
     /// Parse input substrait plan, and get native conf map from it.
-    if (backend_conf_map.count(CH_RUNTIME_CONFIG_FILE))
+    if (backend_conf_map.contains(CH_RUNTIME_CONFIG_FILE))
     {
-        auto config_file = backend_conf_map[CH_RUNTIME_CONFIG_FILE];
+        const auto & config_file = backend_conf_map[CH_RUNTIME_CONFIG_FILE];
         if (fs::exists(config_file) && fs::is_regular_file(config_file))
         {
             ConfigProcessor config_processor(config_file, false, true);
             config_processor.setConfigPath(fs::path(config_file).parent_path());
-            auto loaded_config = config_processor.loadConfig(false);
+            const auto loaded_config = config_processor.loadConfig(false);
             config = loaded_config.configuration;
         }
         else
@@ -554,12 +542,8 @@ DB::Context::ConfigurationPtr BackendInitializerUtil::initConfig(std::map<std::s
     else
         config = Poco::AutoPtr(new Poco::Util::MapConfiguration());
 
-    for (const auto & kv : backend_conf_map)
+    for (const auto & [key, value] : backend_conf_map)
     {
-        const auto & key = kv.first;
-        const auto & value = kv.second;
-        // std::cout << "set config key:" << key << ", value:" << value << std::endl;
-
         if (key.starts_with(CH_RUNTIME_CONFIG_PREFIX) && key != CH_RUNTIME_CONFIG_FILE)
         {
             // Apply spark.gluten.sql.columnar.backend.ch.runtime_config.* to config
@@ -574,9 +558,9 @@ void BackendInitializerUtil::initLoggers(DB::Context::ConfigurationPtr config)
 {
     auto level = config->getString("logger.level", "warning");
     if (config->has("logger.log"))
-        local_engine::Logger::initFileLogger(*config, "ClickHouseBackend");
+        local_engine::LoggerExtend::initFileLogger(*config, "ClickHouseBackend");
     else
-        local_engine::Logger::initConsoleLogger(level);
+        local_engine::LoggerExtend::initConsoleLogger(level);
 
     logger = &Poco::Logger::get("ClickHouseBackend");
 }
@@ -586,7 +570,7 @@ void BackendInitializerUtil::initEnvs(DB::Context::ConfigurationPtr config)
     /// Set environment variable TZ if possible
     if (config->has("timezone"))
     {
-        String timezone_name = config->getString("timezone");
+        const String timezone_name = config->getString("timezone");
         if (0 != setenv("TZ", timezone_name.data(), 1)) /// NOLINT
             throw Poco::Exception("Cannot setenv TZ variable");
 
@@ -605,8 +589,7 @@ void BackendInitializerUtil::initEnvs(DB::Context::ConfigurationPtr config)
     setenv("HDFS_ENABLE_LOGGING", "true", true); /// NOLINT
 
     /// Get environment varaible SPARK_USER if possible
-    const char * spark_user_c_str = std::getenv("SPARK_USER");
-    if (spark_user_c_str)
+    if (const char * spark_user_c_str = std::getenv("SPARK_USER"))
         spark_user = spark_user_c_str;
 }
 
@@ -615,20 +598,20 @@ void BackendInitializerUtil::initSettings(std::map<std::string, std::string> & b
     /// Initialize default setting.
     settings.set("date_time_input_format", "best_effort");
 
-    for (const auto & pair : backend_conf_map)
+    for (const auto & [key, value] : backend_conf_map)
     {
         // Firstly apply spark.gluten.sql.columnar.backend.ch.runtime_config.local_engine.settings.* to settings
-        if (pair.first.starts_with(CH_RUNTIME_CONFIG_PREFIX + SETTINGS_PATH + "."))
+        if (key.starts_with(CH_RUNTIME_CONFIG_PREFIX + SETTINGS_PATH + "."))
         {
-            settings.set(pair.first.substr((CH_RUNTIME_CONFIG_PREFIX + SETTINGS_PATH + ".").size()), pair.second);
-            LOG_DEBUG(&Poco::Logger::get("CHUtil"), "Set settings from config key:{} value:{}", pair.first, pair.second);
+            settings.set(key.substr((CH_RUNTIME_CONFIG_PREFIX + SETTINGS_PATH + ".").size()), value);
+            LOG_DEBUG(&Poco::Logger::get("CHUtil"), "Set settings from config key:{} value:{}", key, value);
         }
-        else if (pair.first.starts_with(CH_RUNTIME_SETTINGS_PREFIX))
+        else if (key.starts_with(CH_RUNTIME_SETTINGS_PREFIX))
         {
-            settings.set(pair.first.substr(CH_RUNTIME_SETTINGS_PREFIX.size()), pair.second);
-            LOG_DEBUG(&Poco::Logger::get("CHUtil"), "Set settings key:{} value:{}", pair.first, pair.second);
+            settings.set(key.substr(CH_RUNTIME_SETTINGS_PREFIX.size()), value);
+            LOG_DEBUG(&Poco::Logger::get("CHUtil"), "Set settings key:{} value:{}", key, value);
         }
-        else if (pair.first.starts_with(SPARK_HADOOP_PREFIX + S3A_PREFIX))
+        else if (key.starts_with(SPARK_HADOOP_PREFIX + S3A_PREFIX))
         {
             // Apply general S3 configs, e.g. spark.hadoop.fs.s3a.access.key -> set in fs.s3a.access.key
             // deal with per bucket S3 configs, e.g. fs.s3a.bucket.bucket_name.assumed.role.arn
@@ -638,7 +621,7 @@ void BackendInitializerUtil::initSettings(std::map<std::string, std::string> & b
             // 2. fs.s3a.bucket.bucket_name.assumed.role.session.name
             // 3. fs.s3a.bucket.bucket_name.endpoint
             // 4. fs.s3a.bucket.bucket_name.assumed.role.externalId (non hadoop official)
-            settings.set(pair.first.substr(SPARK_HADOOP_PREFIX.length()), pair.second);
+            settings.set(key.substr(SPARK_HADOOP_PREFIX.length()), value);
         }
     }
 
@@ -673,9 +656,7 @@ void BackendInitializerUtil::initContexts(DB::Context::ConfigurationPtr config)
     /// Make sure global_context and shared_context are constructed only once.
     auto & shared_context = SerializedPlanParser::shared_context;
     if (!shared_context.get())
-    {
         shared_context = SharedContextHolder(Context::createShared());
-    }
 
     auto & global_context = SerializedPlanParser::global_context;
     if (!global_context)
@@ -686,7 +667,7 @@ void BackendInitializerUtil::initContexts(DB::Context::ConfigurationPtr config)
 
         auto getDefaultPath = [config] -> auto
         {
-            bool use_current_directory_as_tmp = config->getBool("use_current_directory_as_tmp", false);
+            const bool use_current_directory_as_tmp = config->getBool("use_current_directory_as_tmp", false);
             char buffer[PATH_MAX];
             if (use_current_directory_as_tmp && getcwd(buffer, sizeof(buffer)) != nullptr)
                 return std::string(buffer) + "/tmp/libch";
@@ -706,7 +687,7 @@ void BackendInitializerUtil::applyGlobalConfigAndSettings(DB::Context::Configura
     global_context->setSettings(settings);
 }
 
-void BackendInitializerUtil::updateNewSettings(DB::ContextMutablePtr context, DB::Settings & settings)
+void BackendInitializerUtil::updateNewSettings(const DB::ContextMutablePtr & context, const DB::Settings & settings)
 {
     context->setSettings(settings);
 }
@@ -728,6 +709,7 @@ void registerAllFunctions()
         auto & factory = AggregateFunctionCombinatorFactory::instance();
         registerAggregateFunctionCombinatorPartialMerge(factory);
     }
+    registerDisks(true);
 }
 
 void BackendInitializerUtil::registerAllFactories()
@@ -812,22 +794,23 @@ void BackendInitializerUtil::init(std::string * plan)
         });
 }
 
-void BackendInitializerUtil::updateConfig(DB::ContextMutablePtr context, std::string * plan)
+void BackendInitializerUtil::updateConfig(const DB::ContextMutablePtr & context, std::string * plan)
 {
     std::map<std::string, std::string> backend_conf_map = getBackendConfMap(plan);
 
     // configs cannot be updated per query
     // settings can be updated per query
 
-    auto ctx = context->getSettings(); // make a copy
-    initSettings(backend_conf_map, ctx);
-    updateNewSettings(context, ctx);
+    auto settings = context->getSettings(); // make a copy
+    initSettings(backend_conf_map, settings);
+    updateNewSettings(context, settings);
 }
 
 void BackendFinalizerUtil::finalizeGlobally()
 {
     // Make sure client caches release before ClientCacheRegistry
     ReadBufferBuilderFactory::instance().clean();
+    StorageMergeTreeFactory::clear();
     auto & global_context = SerializedPlanParser::global_context;
     auto & shared_context = SerializedPlanParser::shared_context;
     if (global_context)
@@ -852,9 +835,7 @@ UInt64 MemoryUtil::getCurrentMemoryUsage(size_t depth)
     Int64 current_memory_usage = 0;
     auto * current_mem_tracker = DB::CurrentThread::getMemoryTracker();
     for (size_t i = 0; i < depth && current_mem_tracker; ++i)
-    {
         current_mem_tracker = current_mem_tracker->getParent();
-    }
     if (current_mem_tracker)
         current_memory_usage = current_mem_tracker->get();
     return current_memory_usage < 0 ? 0 : current_memory_usage;
@@ -863,12 +844,11 @@ UInt64 MemoryUtil::getCurrentMemoryUsage(size_t depth)
 UInt64 MemoryUtil::getMemoryRSS()
 {
     long rss = 0L;
-    FILE* fp = NULL;
+    FILE * fp = NULL;
     char buf[4096];
     sprintf(buf, "/proc/%d/statm", getpid());
-    if ((fp = fopen(buf, "r")) == NULL) {
+    if ((fp = fopen(buf, "r")) == NULL)
         return 0;
-    }
     fscanf(fp, "%*s%ld", &rss);
     fclose(fp);
     return rss * sysconf(_SC_PAGESIZE);

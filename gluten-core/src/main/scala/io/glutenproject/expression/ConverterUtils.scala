@@ -17,66 +17,33 @@
 package io.glutenproject.expression
 
 import io.glutenproject.backendsapi.BackendsApiManager
+import io.glutenproject.exception.GlutenNotSupportException
 import io.glutenproject.substrait.`type`._
+import io.glutenproject.utils.SubstraitPlanPrinterUtil
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.optimizer._
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
-import io.substrait.proto.Type
+import io.substrait.proto.{NamedStruct, Type}
 
-import java.util.{ArrayList => JArrayList, List => JList}
-import java.util.Locale
+import java.util.{ArrayList => JArrayList, List => JList, Locale}
 
-import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 
 object ConverterUtils extends Logging {
 
-  @tailrec
-  def getAttrFromExpr(fieldExpr: Expression, skipAlias: Boolean = false): AttributeReference = {
-    fieldExpr match {
-      case a: Cast =>
-        getAttrFromExpr(a.child)
-      case a: AggregateExpression =>
-        getAttrFromExpr(a.aggregateFunction.children.head)
-      case a: AttributeReference =>
-        a
-      case a: Alias =>
-        if (skipAlias && a.child.isInstanceOf[AttributeReference]) {
-          getAttrFromExpr(a.child)
-        } else {
-          a.toAttribute.asInstanceOf[AttributeReference]
-        }
-      case a: KnownFloatingPointNormalized =>
-        getAttrFromExpr(a.child)
-      case a: NormalizeNaNAndZero =>
-        getAttrFromExpr(a.child)
-      case c: Coalesce =>
-        getAttrFromExpr(c.children.head)
-      case i: IsNull =>
-        getAttrFromExpr(i.child)
-      case a: Add =>
-        getAttrFromExpr(a.left)
-      case s: Subtract =>
-        getAttrFromExpr(s.left)
-      case m: Multiply =>
-        getAttrFromExpr(m.left)
-      case d: Divide =>
-        getAttrFromExpr(d.left)
-      case u: Upper =>
-        getAttrFromExpr(u.child)
-      case ss: Substring =>
-        getAttrFromExpr(ss.children.head)
-      case other =>
-        throw new UnsupportedOperationException(
-          s"makeStructField is unable to parse from $other (${other.getClass}).")
-    }
+  /**
+   * Get the source Attribute for the input Expression. It will traverse the Expression tree in a
+   * pre-order manner and find the first encountered Attribute. When encountering an Alias, it will
+   * not continue to traverse its child but instead directly return the Attribute output by the
+   * Alias.
+   */
+  def getAttrFromExpr(expr: Expression): Attribute = {
+    expr.transformDown { case alias: Alias => alias.toAttribute }.references.head
   }
 
   def normalizeColName(name: String): String = {
@@ -108,6 +75,10 @@ object ConverterUtils extends Logging {
 
   def collectAttributeTypeNodes(attributes: Seq[Attribute]): JList[TypeNode] = {
     attributes.map(attr => getTypeNode(attr.dataType, attr.nullable)).asJava
+  }
+
+  def collectAttributeTypeNodes(structType: StructType): JList[TypeNode] = {
+    structType.fields.map(f => getTypeNode(f.dataType, f.nullable)).toList.asJava
   }
 
   def collectAttributeNamesWithExprId(attributes: JList[Attribute]): JList[String] = {
@@ -159,6 +130,28 @@ object ConverterUtils extends Logging {
       case _ =>
     }
     nameList
+  }
+
+  /** Convert StructType to Json */
+  def convertNamedStructJson(tableSchema: StructType): String = {
+    val typeNodes = ConverterUtils.collectAttributeTypeNodes(tableSchema)
+    val nameList = tableSchema.fieldNames
+
+    val structBuilder = Type.Struct.newBuilder
+    for (typeNode <- typeNodes.asScala) {
+      structBuilder.addTypes(typeNode.toProtobuf)
+    }
+
+    val nStructBuilder = NamedStruct.newBuilder
+    nStructBuilder.setStruct(structBuilder.build)
+    for (name <- nameList) {
+      nStructBuilder.addNames(name)
+    }
+
+    val namedStructJson = SubstraitPlanPrinterUtil.substraitNamedStructToJson(
+      nStructBuilder
+        .build())
+    namedStructJson.replaceAll("\\\n", "").replaceAll(" ", "")
   }
 
   def isNullable(nullability: Type.Nullability): Boolean = {
@@ -216,7 +209,7 @@ object ConverterUtils extends Logging {
       case Type.KindCase.NOTHING =>
         (NullType, true)
       case unsupported =>
-        throw new UnsupportedOperationException(s"Type $unsupported not supported.")
+        throw new GlutenNotSupportException(s"Type $unsupported not supported.")
     }
   }
 
@@ -267,7 +260,7 @@ object ConverterUtils extends Logging {
       case _: NullType =>
         TypeBuilder.makeNothing()
       case unknown =>
-        throw new UnsupportedOperationException(s"Type $unknown not supported.")
+        throw new GlutenNotSupportException(s"Type $unknown not supported.")
     }
   }
 
@@ -372,8 +365,8 @@ object ConverterUtils extends Logging {
         val scale = decimalType.scale
         // TODO: different with Substrait due to more details here.
         "dec<" + precision + "," + scale + ">"
-      case ArrayType(_, _) =>
-        "list"
+      case ArrayType(elementType, _) =>
+        s"list<${getTypeSigName(elementType)}>"
       case StructType(fields) =>
         // TODO: different with Substrait due to more details here.
         var sigName = "struct<"
@@ -393,7 +386,7 @@ object ConverterUtils extends Logging {
       case NullType =>
         "nothing"
       case other =>
-        throw new UnsupportedOperationException(s"Type $other not supported.")
+        throw new GlutenNotSupportException(s"Type $other not supported.")
     }
   }
 
@@ -413,7 +406,7 @@ object ConverterUtils extends Logging {
       case FunctionConfig.NON =>
         funcName.concat(":")
       case other =>
-        throw new UnsupportedOperationException(s"$other is not supported.")
+        throw new GlutenNotSupportException(s"$other is not supported.")
     }
 
     for (idx <- datatypes.indices) {
@@ -439,7 +432,7 @@ object ConverterUtils extends Logging {
       case LeftAnti =>
         "Anti"
       case other =>
-        throw new UnsupportedOperationException(s"Unsupported join type: $other")
+        throw new GlutenNotSupportException(s"Unsupported join type: $other")
     }
   }
 

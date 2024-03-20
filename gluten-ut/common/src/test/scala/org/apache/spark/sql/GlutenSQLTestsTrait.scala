@@ -16,10 +16,11 @@
  */
 package org.apache.spark.sql
 
+import io.glutenproject.sql.shims.SparkShimLoader
+
 import org.apache.spark.sql.catalyst.plans.logical
 import org.apache.spark.sql.catalyst.util.{sideBySide, stackTraceToString}
-import org.apache.spark.sql.execution.{SparkPlan, SQLExecution}
-import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, ShuffleQueryStageExec}
+import org.apache.spark.sql.execution.SQLExecution
 
 import org.apache.commons.io.FileUtils
 import org.apache.commons.math3.util.Precision
@@ -60,10 +61,11 @@ trait GlutenSQLTestsTrait extends QueryTest with GlutenSQLTestsBaseTrait {
       try df
       catch {
         case ae: AnalysisException =>
-          if (ae.plan.isDefined) {
+          val plan = SparkShimLoader.getSparkShims.getAnalysisExceptionPlan(ae)
+          if (plan.isDefined) {
             fail(s"""
                     |Failed to analyze query: $ae
-                    |${ae.plan.get}
+                    |${plan.get}
                     |
                     |${stackTraceToString(ae)}
                     |""".stripMargin)
@@ -75,52 +77,6 @@ trait GlutenSQLTestsTrait extends QueryTest with GlutenSQLTestsBaseTrait {
     assertEmptyMissingInput(analyzedDF)
 
     GlutenQueryTest.checkAnswer(analyzedDF, expectedAnswer)
-  }
-
-  /**
-   * Get all the children plan of plans.
-   *
-   * @param plans
-   *   : the input plans.
-   * @return
-   */
-  def getChildrenPlan(plans: Seq[SparkPlan]): Seq[SparkPlan] = {
-    if (plans.isEmpty) {
-      return Seq()
-    }
-
-    val inputPlans: Seq[SparkPlan] = plans.map {
-      case stage: ShuffleQueryStageExec => stage.plan
-      case plan => plan
-    }
-
-    var newChildren: Seq[SparkPlan] = Seq()
-    inputPlans.foreach {
-      plan =>
-        newChildren = newChildren ++ getChildrenPlan(plan.children)
-        // To avoid duplication of WholeStageCodegenXXX and its children.
-        if (!plan.nodeName.startsWith("WholeStageCodegen")) {
-          newChildren = newChildren :+ plan
-        }
-    }
-    newChildren
-  }
-
-  /**
-   * Get the executed plan of a data frame.
-   *
-   * @param df
-   *   : dataframe.
-   * @return
-   *   A sequence of executed plans.
-   */
-  def getExecutedPlan(df: DataFrame): Seq[SparkPlan] = {
-    df.queryExecution.executedPlan match {
-      case exec: AdaptiveSparkPlanExec =>
-        getChildrenPlan(Seq(exec.executedPlan))
-      case plan =>
-        getChildrenPlan(Seq(plan))
-    }
   }
 }
 

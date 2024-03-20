@@ -39,7 +39,7 @@ ShuffleReader::ShuffleReader(std::unique_ptr<ReadBuffer> in_, bool compressed, I
     {
         compressed_in = std::make_unique<CompressedReadBuffer>(*in);
         configureCompressedReadBuffer(static_cast<DB::CompressedReadBuffer &>(*compressed_in));
-        input_stream = std::make_unique<NativeReader>(*compressed_in);
+        input_stream = std::make_unique<NativeReader>(*compressed_in, max_shuffle_read_rows_, max_shuffle_read_bytes_);
     }
     else
     {
@@ -48,44 +48,8 @@ ShuffleReader::ShuffleReader(std::unique_ptr<ReadBuffer> in_, bool compressed, I
 }
 Block * ShuffleReader::read()
 {
-    // Avoid to generate out a lot of small blocks.
-    size_t buffer_rows = 0;
-    size_t buffer_bytes = 0;
-    std::vector<DB::Block> blocks;
-    if (pending_block)
-    {
-        blocks.emplace_back(std::move(pending_block));
-        buffer_rows += blocks.back().rows();
-        buffer_bytes += blocks.back().bytes();
-        pending_block = {};
-    }
-
-    while (!buffer_rows
-           || ((max_shuffle_read_rows < 0 || buffer_rows < max_shuffle_read_rows)
-               && (max_shuffle_read_bytes < 0 || buffer_bytes < max_shuffle_read_bytes)))
-    {
-        auto block = input_stream->read();
-        if (!block.rows())
-            break;
-        if (!blocks.empty()
-            && (blocks[0].info.is_overflows != block.info.is_overflows || blocks[0].info.bucket_num != block.info.bucket_num))
-        {
-            pending_block = std::move(block);
-            break;
-        }
-        buffer_rows += block.rows();
-        buffer_bytes += block.bytes();
-        blocks.emplace_back(std::move(block));
-    }
-
-    DB::Block final_block;
-    if (!blocks.empty())
-    {
-        auto block_info = blocks[0].info;
-        final_block = DB::concatenateBlocks(blocks);
-        final_block.info = block_info;
-    }
-    setCurrentBlock(final_block);
+    auto block = input_stream->read();
+    setCurrentBlock(block);
     if (unlikely(header.columns() == 0))
         header = currentBlock().cloneEmpty();
     return &currentBlock();
@@ -108,17 +72,20 @@ bool ReadBufferFromJavaInputStream::nextImpl()
         working_buffer.resize(count);
     return count > 0;
 }
+
 int ReadBufferFromJavaInputStream::readFromJava() const
 {
     GET_JNIENV(env)
     jint count = safeCallIntMethod(
-        env, java_in, ShuffleReader::input_stream_read, reinterpret_cast<jlong>(working_buffer.begin()), memory.m_capacity);
+        env, java_in, ShuffleReader::input_stream_read, reinterpret_cast<jlong>(internal_buffer.begin()), internal_buffer.size());
     CLEAN_JNIENV
     return count;
 }
+
 ReadBufferFromJavaInputStream::ReadBufferFromJavaInputStream(jobject input_stream) : java_in(input_stream)
 {
 }
+
 ReadBufferFromJavaInputStream::~ReadBufferFromJavaInputStream()
 {
     GET_JNIENV(env)
@@ -128,13 +95,14 @@ ReadBufferFromJavaInputStream::~ReadBufferFromJavaInputStream()
 
 bool ReadBufferFromByteArray::nextImpl()
 {
-    if (read_pos_ >= array_size_)
+    if (read_pos >= array_size)
         return false;
+
     GET_JNIENV(env)
-    const size_t read_size = std::min(memory.m_capacity, array_size_ - read_pos_);
-    env->GetByteArrayRegion(array_, read_pos_, read_size, reinterpret_cast<jbyte *>(working_buffer.begin()));
+    const size_t read_size = std::min(internal_buffer.size(), array_size - read_pos);
+    env->GetByteArrayRegion(array, read_pos, read_size, reinterpret_cast<jbyte *>(internal_buffer.begin()));
     working_buffer.resize(read_size);
-    read_pos_ += read_size;
+    read_pos += read_size;
     CLEAN_JNIENV
     return true;
 }

@@ -20,6 +20,7 @@
 
 #include "compute/ResultIterator.h"
 #include "config/GlutenConfig.h"
+#include "iceberg/IcebergPlanConverter.h"
 #include "operators/plannodes/RowVectorStream.h"
 #include "velox/common/file/FileSystems.h"
 
@@ -37,11 +38,15 @@ VeloxPlanConverter::VeloxPlanConverter(
       substraitVeloxPlanConverter_(veloxPool, confMap, writeFilesTempPath, validationMode),
       pool_(veloxPool) {
   // avoid include RowVectorStream.h in SubstraitToVeloxPlan.cpp, it may cause redefinition of array abi.h.
-  auto factory = [inputIters = std::move(inputIters)](
+  auto factory = [inputIters = std::move(inputIters), validationMode = validationMode](
                      std::string nodeId, memory::MemoryPool* pool, int32_t streamIdx, RowTypePtr outputType) {
-    VELOX_CHECK_LT(streamIdx, inputIters.size(), "Could not find stream index {} in input iterator list.", streamIdx);
-    auto vectorStream = std::make_shared<RowVectorStream>(pool, inputIters[streamIdx], outputType);
-    return std::make_shared<ValueStreamNode>(nodeId, outputType, std::move(vectorStream));
+    std::shared_ptr<ResultIterator> iterator;
+    if (!validationMode) {
+      VELOX_CHECK_LT(streamIdx, inputIters.size(), "Could not find stream index {} in input iterator list.", streamIdx);
+      iterator = inputIters[streamIdx];
+    }
+    auto valueStream = std::make_shared<RowVectorStream>(pool, iterator, outputType);
+    return std::make_shared<ValueStreamNode>(nodeId, outputType, std::move(valueStream));
   };
   substraitVeloxPlanConverter_.setValueStreamNodeFactory(std::move(factory));
 }
@@ -56,6 +61,7 @@ std::shared_ptr<SplitInfo> parseScanSplitInfo(
   splitInfo->starts.reserve(fileList.size());
   splitInfo->lengths.reserve(fileList.size());
   splitInfo->partitionColumns.reserve(fileList.size());
+  splitInfo->metadataColumns.reserve(fileList.size());
   for (const auto& file : fileList) {
     // Expect all Partitions share the same index.
     splitInfo->partitionIndex = file.partition_index();
@@ -65,6 +71,12 @@ std::shared_ptr<SplitInfo> parseScanSplitInfo(
       partitionColumnMap[partitionColumn.key()] = partitionColumn.value();
     }
     splitInfo->partitionColumns.emplace_back(partitionColumnMap);
+
+    std::unordered_map<std::string, std::string> metadataColumnMap;
+    for (const auto& metadataColumn : file.metadata_columns()) {
+      metadataColumnMap[metadataColumn.key()] = metadataColumn.value();
+    }
+    splitInfo->metadataColumns.emplace_back(metadataColumnMap);
 
     splitInfo->paths.emplace_back(file.uri_file());
     splitInfo->starts.emplace_back(file.start());
@@ -81,6 +93,9 @@ std::shared_ptr<SplitInfo> parseScanSplitInfo(
         break;
       case SubstraitFileFormatCase::kText:
         splitInfo->format = dwio::common::FileFormat::TEXT;
+        break;
+      case SubstraitFileFormatCase::kIceberg:
+        splitInfo = IcebergPlanConverter::parseIcebergSplitInfo(file, std::move(splitInfo));
         break;
       default:
         splitInfo->format = dwio::common::FileFormat::UNKNOWN;
@@ -99,7 +114,7 @@ void parseLocalFileNodes(
     const auto& localFile = localFiles[i];
     const auto& fileList = localFile.items();
 
-    splitInfos.push_back(std::move(parseScanSplitInfo(fileList)));
+    splitInfos.push_back(parseScanSplitInfo(fileList));
   }
 
   planConverter->setSplitInfos(std::move(splitInfos));
